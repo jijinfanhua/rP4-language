@@ -1,0 +1,160 @@
+#include <core.rp4>
+#include <v1model.rp4>
+
+stream packet_seg = packet[100];
+
+headers {
+	hdr ethernet_t {
+		bit<48> dstAddr;
+		bit<48> srcAddr;
+		bit<16> etherType;
+		implicit parser(etherType) {
+			0x1212: myTunnel_t;
+			0x0800: ipv4_t;
+			default: accept;
+		}
+	}
+	
+	hdr myTunnel_t {
+		bit<16> proto_id;
+		bit<16> dst_id;
+		implicit parser(proto_id) {
+			0x0800: ipv4_t;
+			default: accept;
+		}
+	}
+	
+	hdr ipv4_t {
+		bit<4>    version;
+		bit<4>    ihl;
+		bit<8>    diffserv;
+		bit<16>   totalLen;
+		bit<16>   identification;
+		bit<3>    flags;
+		bit<13>   fragOffset;
+		bit<8>    ttl;
+		bit<8>    protocol;
+		bit<16>   hdrChecksum;
+		bit<32> srcAddr;
+		bit<32> dstAddr;
+		implicit parser() {
+			default: accept;
+		}
+		
+		implicit func verify_checksum() {
+			return this.hdrChecksum == HashAlgorithm.csum16(this.version,
+												this.ihl,
+												this.diffserv,
+												this.totalLen,
+												this.identification,
+												this.flags,
+												this.fragOffset,
+												this.ttl,
+												this.protocol,
+												this.srcAddr,
+												this.dstAddr);
+		} # do when extract
+		
+		implicit func update_checksum() {
+			this.hdrChecksum = HashAlgorithm.csum16(this.version,
+												this.ihl,
+												this.diffserv,
+												this.totalLen,
+												this.identification,
+												this.flags,
+												this.fragOffset,
+												this.ttl,
+												this.protocol,
+												this.srcAddr,
+												this.dstAddr);
+		}
+	}
+}
+
+structs {
+	struct metadata{
+		
+	}meta;
+}
+
+actions {
+	action ipv4_forward(para) {
+		modify_field(standard_metadata.egress_spec, para.port);
+		modify_field(hs.ethernet.srcAddr, hs.ethernet.dstAddr);
+		modify_field(hs.ethernet.dstAddr, para.dstAddr);
+		decrement(hs.ipv4.ttl);
+		goto rP4_Ingress.myTunnel_forward_s;
+	}
+	
+	action myTunnel_forward(para) {
+		modify_field(standard_metadata.egress_spec, para.port);
+		goto rP4_Egress;
+	}
+	
+	action drop() {
+        mark_to_drop(standard_metadata);
+    }
+}
+
+tables {
+	table ipv4_lpm {
+        key = {
+            hs.ipv4.dstAddr: lpm;
+        }
+        size = 1024;
+    }
+	
+	table myTunnel_exact {
+        key = {
+            hs.myTunnel.dst_id: exact;
+        }
+        size = 1024;
+    }
+}
+
+header_sequence {
+	ethernet_t   ethernet;
+    myTunnel_t   myTunnel;
+    ipv4_t       ipv4;
+}hs;
+
+control rP4_Ingress {
+	stage ipv4_forward_s {
+		parser:
+			hs.ipv4 = packet_seg.extract(ipv4_t) ? 
+				[verify_checksum() => drop()] : [drop()];
+		matcher:
+			action, para = ipv4_lpm.lpm([hs.ipv4.dstAddr]);
+		executer:
+			switch action:
+				1: ipv4_forward(para);
+				2: drop();
+				default: drop();
+	}
+	
+	stage myTunnel_forward_s {
+		parser:
+			hs.myTunnel = packet_seg.extract(myTunnel_t) ? [] : [continue];
+		matcher:
+			action, para = myTunnel_exact.exact([hs.myTunnel.dst_id]);
+		executer:
+			switch action:
+				case 1: myTunnel_forward(para);
+				case 2: drop();
+				default: drop()
+	}
+}
+
+control rP4_Egress -> [update_checksum()] {
+	
+}
+
+pipelines {
+	pipeline p0{
+		rP4_Ingress.myTunnel_forward_s
+	}
+	
+	pipeline p1{
+		rP4_Ingress.ipv4_forward_s
+	}
+}
